@@ -801,7 +801,7 @@ struct TABLE_SHARE
   bool can_cmp_whole_record;
   bool table_creation_was_logged;
   bool non_determinstic_insert;
-  bool vcols_need_refixing;
+  bool vcols_need_refixing;             /* Just a hint if any of vcols has need_refixing() */
   bool has_update_default_function;
   ulong table_map_id;                   /* for row-based replication */
 
@@ -1380,6 +1380,7 @@ public:
   */
   bool alias_name_used;              /* true if table_name is alias */
   bool get_fields_in_item_tree;      /* Signal to fix_field */
+  List<Virtual_column_info> vcol_session_cleanup_list;
 private:
   bool m_needs_reopen;
   bool created;    /* For tmp tables. TRUE <=> tmp table was actually created.*/

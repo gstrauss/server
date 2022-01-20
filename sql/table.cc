@@ -2841,15 +2841,19 @@ bool Virtual_column_info::fix_expr(THD *thd)
     @note this is done for all vcols for INSERT/UPDATE/DELETE,
     and only as needed for SELECTs.
 */
-bool Virtual_column_info::fix_session_expr(THD *thd)
+bool Virtual_column_info::fix_session_expr(THD *thd, TABLE *table)
 {
-  // TODO: remove either this check or vcols_need_refixing
-  if (!(flags & (VCOL_TIME_FUNC|VCOL_SESSION_FUNC)))
+  if (!need_refixing())
     return false;
 
   DBUG_ASSERT(!expr->fixed);
   if (expr->walk(&Item::change_context_processor, 0, thd->lex->current_context()))
     return true;
+  /*
+    NOTE: fix_session_expr_for_read() may be called from an arbitrary field.
+    We cleanup only those expressions we actually refixed.
+  */
+  table->vcol_session_cleanup_list.push_back(this, thd->mem_root);
   if (fix_expr(thd))
     return true;
   if (expr->walk(&Item::change_context_processor, 0, NULL))
@@ -2860,9 +2864,7 @@ bool Virtual_column_info::fix_session_expr(THD *thd)
 
 bool Virtual_column_info::cleanup_session_expr()
 {
-  if (!(flags & (VCOL_TIME_FUNC|VCOL_SESSION_FUNC)))
-    return false;
-
+  DBUG_ASSERT(need_refixing());
   if (expr->walk(&Item::cleanup_excluding_fields_processor, 0, 0))
     return true;
   return false;
@@ -2955,15 +2957,22 @@ Vcol_expr_context::~Vcol_expr_context()
 */
 bool Virtual_column_info::fix_session_expr_for_read(THD *thd, Field *field)
 {
-  const TABLE_LIST *tl= field->table->pos_in_table_list;
-  if (!tl || tl->lock_type >= TL_WRITE_ALLOW_WRITE)
+  TABLE *table= field->table;
+  const TABLE_LIST *tl= table->pos_in_table_list;
+  if (!tl || tl->lock_type >= TL_WRITE_ALLOW_WRITE || !need_refixing())
     return false;
 
-  Vcol_expr_context expr_ctx(thd, field->table);
+  DBUG_ASSERT(table->s->vcols_need_refixing);
+
+  Vcol_expr_context expr_ctx(thd, table);
   if (expr_ctx.init())
     return true;
 
-  const bool res= fix_session_expr(thd);
+  // FIXME: remove?
+  if (expr->fixed)
+    cleanup_session_expr();
+
+  const bool res= fix_session_expr(thd, table);
   return res;
 }
 
@@ -2973,23 +2982,30 @@ bool TABLE::vcol_fix_exprs(THD *thd)
   if (pos_in_table_list->placeholder() || !s->vcols_need_refixing)
     return false;
 
+  bool result= true;
   Vcol_expr_context expr_ctx(thd, this);
+
+  if (!vcol_session_cleanup_list.is_empty())
+  {
+    /* We are under trigger FIXME: assertion */
+    if (vcol_cleanup_exprs(thd))
+      goto end;
+  }
+
   if (expr_ctx.init())
     return true;
 
-  bool result= true;
-
   for (Field **vf= vfield; vf && *vf; vf++)
-    if ((*vf)->vcol_info->fix_session_expr(thd))
+    if ((*vf)->vcol_info->fix_session_expr(thd, this))
       goto end;
 
   for (Field **df= default_field; df && *df; df++)
     if ((*df)->default_value &&
-        (*df)->default_value->fix_session_expr(thd))
+        (*df)->default_value->fix_session_expr(thd, this))
       goto end;
 
   for (Virtual_column_info **cc= check_constraints; cc && *cc; cc++)
-    if ((*cc)->fix_session_expr(thd))
+    if ((*cc)->fix_session_expr(thd, this))
       goto end;
 
   result= false;
@@ -3002,31 +3018,17 @@ end:
 
 bool TABLE::vcol_cleanup_exprs(THD *thd)
 {
-  if (pos_in_table_list->placeholder() || !s->vcols_need_refixing)
+  if (vcol_session_cleanup_list.is_empty())
     return false;
 
-  Vcol_expr_context expr_ctx(thd, this);
-  if (expr_ctx.init())
-    return true;
+  List_iterator<Virtual_column_info> it(vcol_session_cleanup_list);
+  bool result= false;
 
-  bool result= true;
+  while (Virtual_column_info *vcol= it++)
+    result|= vcol->cleanup_session_expr();
 
-  for (Field **vf= vfield; vf && *vf; vf++)
-    if ((*vf)->vcol_info->cleanup_session_expr())
-      goto end;
+  vcol_session_cleanup_list.empty();
 
-  for (Field **df= default_field; df && *df; df++)
-    if ((*df)->default_value &&
-        (*df)->default_value->cleanup_session_expr())
-      goto end;
-
-  for (Virtual_column_info **cc= check_constraints; cc && *cc; cc++)
-    if ((*cc)->cleanup_session_expr())
-      goto end;
-
-  result= false;
-
-end:
   DBUG_ASSERT(!result || thd->get_stmt_da()->is_error());
   return result;
 }
@@ -3059,6 +3061,7 @@ bool Virtual_column_info::fix_and_check_expr(THD *thd, TABLE *table)
   DBUG_PRINT("info", ("vcol: %p", this));
   DBUG_ASSERT(expr);
 
+  /* NOTE: constants are fixed when constructed */
   if (expr->fixed)
     DBUG_RETURN(0); // nothing to do
 
@@ -3109,8 +3112,11 @@ bool Virtual_column_info::fix_and_check_expr(THD *thd, TABLE *table)
   }
   flags= res.errors;
 
-  if (flags & VCOL_SESSION_FUNC)
+  if (need_refixing())
+  {
     table->s->vcols_need_refixing= true;
+    cleanup_session_expr();
+  }
 
   DBUG_RETURN(0);
 }
@@ -3269,6 +3275,7 @@ enum open_frm_error open_table_from_share(THD *thd, TABLE_SHARE *share,
   outparam->covering_keys.init();
   outparam->intersect_keys.init();
   outparam->keys_in_use_for_query.init();
+  outparam->vcol_session_cleanup_list.empty();
 
   /* Allocate handler */
   outparam->file= 0;
@@ -7964,6 +7971,12 @@ int TABLE::update_virtual_fields(handler *h, enum_vcol_update_mode update_mode)
 
     if (update)
     {
+      if (!vcol_info->expr->fixed &&
+          vcol_info->fix_session_expr_for_read(in_use, vf))
+      {
+        // FIXME: error is not used?
+        error= 1;
+      }
       int field_error __attribute__((unused)) = 0;
       /* Compute the actual value of the virtual fields */
       if (vcol_info->expr->save_in_field(vf, 0))
