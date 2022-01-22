@@ -801,7 +801,7 @@ struct TABLE_SHARE
   bool can_cmp_whole_record;
   bool table_creation_was_logged;
   bool non_determinstic_insert;
-  bool vcols_need_refixing;             /* Just a hint if any of vcols has need_refixing() */
+  bool vcol_fix_exprs;             /* Just a hint if any of vcols has need_refixing() */
   bool has_update_default_function;
   ulong table_map_id;                   /* for row-based replication */
 

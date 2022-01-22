@@ -2924,12 +2924,17 @@ bool Vcol_expr_context::init()
   table->grant.want_privilege= false;
   TABLE_LIST const *tl= table->pos_in_table_list;
 
-  /* Avoid fix_outer_field() in Item_field::fix_fields(). */
-  lex.current_context()->select_lex= tl->select_lex;
   lex.sql_command= old_lex->sql_command;
+  DBUG_ASSERT(tl || table->s->tmp_table);
 
-  if (tl->security_ctx)
-    thd->security_ctx= tl->security_ctx;
+  if (tl)
+  {
+    /* Avoid fix_outer_field() in Item_field::fix_fields(). */
+    lex.current_context()->select_lex= tl->select_lex;
+
+    if (tl->security_ctx)
+      thd->security_ctx= tl->security_ctx;
+  }
 
   thd->variables.sql_mode= 0;
 
@@ -2962,7 +2967,7 @@ bool Virtual_column_info::fix_session_expr_for_read(THD *thd, Field *field)
   if (!tl || tl->lock_type >= TL_WRITE_ALLOW_WRITE || !need_refixing())
     return false;
 
-  DBUG_ASSERT(table->s->vcols_need_refixing);
+  DBUG_ASSERT(table->s->vcol_fix_exprs);
 
   Vcol_expr_context expr_ctx(thd, table);
   if (expr_ctx.init())
@@ -2979,7 +2984,9 @@ bool Virtual_column_info::fix_session_expr_for_read(THD *thd, Field *field)
 
 bool TABLE::vcol_fix_exprs(THD *thd)
 {
-  if (pos_in_table_list->placeholder() || !s->vcols_need_refixing)
+  DBUG_ASSERT(pos_in_table_list || s->tmp_table);
+  if ((pos_in_table_list && pos_in_table_list->placeholder()) ||
+      !s->vcol_fix_exprs)
     return false;
 
   bool result= true;
@@ -3114,7 +3121,7 @@ bool Virtual_column_info::fix_and_check_expr(THD *thd, TABLE *table)
 
   if (need_refixing())
   {
-    table->s->vcols_need_refixing= true;
+    table->s->vcol_fix_exprs= true;
     cleanup_session_expr();
   }
 
@@ -7901,6 +7908,7 @@ int TABLE::update_virtual_fields(handler *h, enum_vcol_update_mode update_mode)
     DBUG_RETURN(0);
 
   error= 0;
+  // FIXME: remove?
   in_use->set_n_backup_active_arena(expr_arena, &backup_arena);
 
   /* When reading or deleting row, ignore errors from virtual columns */
@@ -7908,6 +7916,7 @@ int TABLE::update_virtual_fields(handler *h, enum_vcol_update_mode update_mode)
       update_mode == VCOL_UPDATE_FOR_DELETE ||
       update_mode == VCOL_UPDATE_INDEXED)
   {
+    // FIXME: remove?
     in_use->push_internal_handler(&Suppress_errors);
     handler_pushed= 1;
   }
@@ -8051,6 +8060,7 @@ int TABLE::update_default_fields(bool ignore_errors)
   DBUG_ENTER("TABLE::update_default_fields");
   DBUG_ASSERT(default_field);
 
+  // FIXME: is it needed?
   in_use->set_n_backup_active_arena(expr_arena, &backup_arena);
 
   /* Iterate over fields with default functions in the table */
