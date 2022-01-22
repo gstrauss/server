@@ -5547,7 +5547,45 @@ bool mysql_create_like_table(THD* thd, TABLE_LIST* table,
 #ifdef WITH_PARTITION_STORAGE_ENGINE
   /* Partition info is not handled by mysql_prepare_alter_table() call. */
   if (src_table->table->part_info)
+  {
+    List_iterator_fast <partition_element>
+      part_it(src_table->table->part_info->partitions);
+    partition_element *pe;
+
     thd->work_part_info= src_table->table->part_info->get_clone(thd);
+
+    /*
+      The CREATE TABLE LIKE should not inherit the DATA DIRECTORY
+      and INDEX DIRECTORY from the base table.
+      So we create clones for partitions and subpartitions just
+      to set these empty.
+      If they are empty already, we don't have to clone at all
+      but decided to do it always for sake of uniformity.
+    */
+    thd->work_part_info->partitions.empty();
+    while ((pe= part_it++))
+    {
+      partition_element *pe_clone= new (thd->mem_root) partition_element();
+      partition_element *sub_pe;
+      *pe_clone= *pe;
+      pe_clone->data_file_name= pe_clone->index_file_name= NULL;
+      if (thd->work_part_info->is_sub_partitioned())
+      {
+        List_iterator<partition_element> sub_it(pe->subpartitions);
+        pe_clone->subpartitions.empty();
+        while ((sub_pe= sub_it++))
+        {
+          partition_element *sub_clone=
+            new (thd->mem_root) partition_element();
+
+          *sub_clone= *sub_pe;
+          sub_clone->data_file_name= sub_clone->index_file_name= NULL; 
+          pe_clone->subpartitions.push_back(sub_clone, thd->mem_root);
+        }
+      }
+      thd->work_part_info->partitions.push_back(pe_clone, thd->mem_root);
+    }
+  }
 #endif
 
   /*
